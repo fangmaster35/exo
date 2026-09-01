@@ -178,16 +178,24 @@ class Node:
 
         Cross-subnet clusters run with multicast discovery unreachable, so a
         peer that fails to dial at startup (node still booting, transient
-        network) would otherwise never join the topology. Retry every 30s
-        until every configured peer has connected once; a peer that restarts
-        later reconnects through its own bootstrap dial.
+        network) would otherwise never join the topology. Uses exponential
+        backoff (2s -> 4s -> 8s -> 16s -> 30s cap) with jitter so nodes
+        that restart simultaneously converge quickly instead of waiting a
+        flat 30s; a peer that restarts later reconnects through its own
+        bootstrap dial.
         """
+        import random
+
         pending = dict.fromkeys(self.bootstrap_peers)
         if not pending:
             return
         logger.info(
             f"Bootstrap peers configured: {', '.join(pending)} — dialing with retry"
         )
+        # Signal to election: bootstrap is in progress, delay initial campaign.
+        self._bootstrap_done = anyio.Event()
+        attempt = 0
+        first_connected = False
         while pending:
             for peer in list(pending):
                 host, _, port_str = peer.partition(":")
@@ -204,6 +212,11 @@ class Node:
                     if connected:
                         logger.info(f"Bootstrap peer {host}:{port} connected")
                         del pending[peer]
+                        # Signal election on FIRST successful connection so we
+                        # don't block forever if one peer is permanently down.
+                        if not first_connected:
+                            first_connected = True
+                            self._bootstrap_done.set()
                     else:
                         logger.warning(
                             f"Bootstrap peer {host}:{port} already connected or failed — retrying"
@@ -211,7 +224,45 @@ class Node:
                 except Exception as e:
                     logger.warning(f"Bootstrap peer {host}:{port} unreachable ({e}) — retrying")
             if pending:
-                await anyio.sleep(30)
+                # Exponential backoff: 2, 4, 8, 16, 30 (cap), with ±25% jitter
+                base = min(2 ** (attempt + 1), 30)
+                jitter = base * 0.25 * (random.random() * 2 - 1)
+                delay = base + jitter
+                logger.debug(
+                    f"Bootstrap: {len(pending)} peers pending, retrying in {delay:.1f}s "
+                    f"(attempt {attempt + 1})"
+                )
+                await anyio.sleep(delay)
+                attempt += 1
+        # All peers connected (or dropped as invalid) — ensure event is set
+        # even if no peer ever connected (single-node fallback).
+        if hasattr(self, "_bootstrap_done") and not self._bootstrap_done.is_set():
+            self._bootstrap_done.set()
+
+    async def _deferred_election_start(self) -> None:
+        """Wait for bootstrap peers to connect before starting the initial election.
+
+        When ``--bootstrap-peers`` is configured, each node spins up the router
+        and election subsystems immediately (so peer messages can arrive) but
+        delays the first campaign until bootstrap has connected to at least one
+        peer or a grace period expires.  This prevents the race where
+        simultaneous restarts cause every node to self-elect as master of a
+        solo partition before any bootstrap dial has landed.
+
+        Grace period (15s) prevents permanent hang when all peers are down —
+        the node falls back to self-election, which is correct for single-node
+        or fully-isolated deployments.
+        """
+        with anyio.move_on_after(15.0):
+            await self._bootstrap_done.wait()
+        if self._bootstrap_done.is_set():
+            logger.info("Bootstrap phase complete — starting election")
+        else:
+            logger.warning(
+                "Bootstrap grace period expired (15s) with no peer connected — "
+                "starting election anyway (single-node fallback)"
+            )
+        await self.election.run()
 
     async def run(self):
         async with self._tg as tg:
@@ -219,7 +270,15 @@ class Node:
             signal.signal(signal.SIGTERM, lambda _, __: self.shutdown())
             tg.start_soon(self.router.run)
             tg.start_soon(self.event_router.run)
-            tg.start_soon(self.election.run)
+            # When bootstrap peers are configured, defer election start until
+            # at least one peer connects (or all fail). Without this gate,
+            # simultaneous restarts cause each node to self-elect as master
+            # of a solo partition before bootstrap has time to dial, then
+            # spend 25-55s recovering from split-brain once peers connect.
+            if self.bootstrap_peers:
+                tg.start_soon(self._deferred_election_start)
+            else:
+                tg.start_soon(self.election.run)
             tg.start_soon(self._bootstrap_peers_loop)
             if self.download_coordinator:
                 tg.start_soon(self.download_coordinator.run)
