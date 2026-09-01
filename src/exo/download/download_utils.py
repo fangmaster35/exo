@@ -61,6 +61,13 @@ class HuggingFaceRateLimitError(Exception):
         self.retry_after = retry_after
 
 
+class HuggingFaceNotFoundError(Exception):
+    """Raised when HuggingFace returns 404 for a model or file list.
+
+    Non-retryable: a 404 means the repo/files don't exist on HF.
+    """
+
+
 def _parse_retry_after(headers: Mapping[str, str]) -> float | None:
     """Parse seconds-to-reset from HF's RateLimit header.
 
@@ -550,6 +557,9 @@ async def fetch_file_list_with_retry(
             return await _fetch_file_list(model_id, revision, path, recursive)
         except HuggingFaceAuthenticationError:
             raise
+        except HuggingFaceNotFoundError:
+            # Non-retryable: model doesn't exist on HF, no point hammering the API
+            raise
         except HuggingFaceRateLimitError as e:
             if attempt == n_attempts - 1:
                 raise
@@ -611,6 +621,10 @@ async def _fetch_file_list(
                     "and may be truncated; cursor pagination is not implemented"
                 )
             return files
+        elif response.status == 404:
+            raise HuggingFaceNotFoundError(
+                f"Model {model_id} not found on HuggingFace (HTTP 404)"
+            )
         else:
             raise Exception(f"Failed to fetch file list: {response.status}")
 
@@ -1039,7 +1053,7 @@ async def download_shard(
             skip_internet=skip_internet,
             on_connection_lost=on_connection_lost,
         )
-    except FileNotFoundError:
+    except (FileNotFoundError, HuggingFaceNotFoundError):
         not_started_progress = RepoDownloadProgress(
             repo_id=str(model_id),
             repo_revision=revision,
