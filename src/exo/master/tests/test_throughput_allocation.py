@@ -74,6 +74,12 @@ def test_estimate_memory_bandwidth_matches_known_chips() -> None:
     )
     assert (
         estimate_memory_bandwidth_gigabytes_per_second(
+            NodeIdentity(chip_id="NVIDIA GeForce RTX 5060 Ti")
+        )
+        == 448.0
+    )
+    assert (
+        estimate_memory_bandwidth_gigabytes_per_second(
             NodeIdentity(chip_id="Unknown Chip")
         )
         is None
