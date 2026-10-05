@@ -454,12 +454,19 @@ class InfoGatherer:
             tg.start_soon(self._monitor_misc, 60)
             tg.start_soon(self._monitor_static_info, 60)
             tg.start_soon(self._monitor_disk_usage, 30)
+            tg.start_soon(self._monitor_node_backends, 60)
+            tg.start_soon(self._monitor_node_config, 60)
 
             nc = await NodeConfig.gather()
             if nc is not None:
                 await self.info_sender.send(nc)
 
-            await self.info_sender.send(await NodeBackends.gather())
+            try:
+                await self.info_sender.send(await NodeBackends.gather())
+            except Exception as e:
+                logger.opt(exception=e).warning(
+                    "Error gathering node backends at startup"
+                )
 
     def shutdown(self):
         self._tg.cancel_tasks()
@@ -472,6 +479,41 @@ class InfoGatherer:
             except Exception as e:
                 logger.opt(exception=e).warning("Error gathering static node info")
             await anyio.sleep(static_info_poll_interval)
+
+    async def _monitor_node_backends(self, backends_poll_interval: float):
+        """Periodically re-advertise this node's backends.
+
+        NodeBackends is only gathered once at startup; if that first message
+        is lost (e.g. the router is still connecting when the gatherer
+        starts), the node advertises no backends and placement rejects every
+        cycle containing it — permanently, until the app restarts. Re-sending
+        on an interval makes the advertisement self-healing.
+        """
+        while True:
+            try:
+                with fail_after(30):
+                    await self.info_sender.send(await NodeBackends.gather())
+            except Exception as e:
+                logger.opt(exception=e).warning("Error gathering node backends")
+            await anyio.sleep(backends_poll_interval)
+
+    async def _monitor_node_config(self, config_poll_interval: float):
+        """Periodically re-advertise this node's NodeConfig (identity).
+
+        NodeConfig is only gathered once at startup. If that first message is
+        lost, the node can join elections and be 'discovered' by peers yet
+        never appear in any node's topology (seen live 08-07: Linux
+        9519a896). Re-sending on an interval makes the identity self-healing.
+        """
+        while True:
+            try:
+                with fail_after(30):
+                    nc = await NodeConfig.gather()
+                    if nc is not None:
+                        await self.info_sender.send(nc)
+            except Exception as e:
+                logger.opt(exception=e).warning("Error gathering node config")
+            await anyio.sleep(config_poll_interval)
 
     async def _monitor_misc(self, misc_poll_interval: float):
         while True:
